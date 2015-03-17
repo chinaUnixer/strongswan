@@ -62,27 +62,19 @@ METHOD(job_t, execute, job_requeue_t,
 	linked_list_t *children, *vips;
 	enumerator_t *enumerator, *subenum;
 	ike_sa_id_t *id;
-	ike_sa_t *ike_sa;
+	ike_sa_t *new_sa, *old_sa;
 	child_sa_t *child_sa;
 
-	ike_sa = charon->ike_sa_manager->checkout(charon->ike_sa_manager, this->id);
-	if (ike_sa)
+	new_sa = charon->ike_sa_manager->checkout(charon->ike_sa_manager, this->id);
+	if (new_sa)
 	{
 		/* get what we need from new SA */
-		me = ike_sa->get_my_host(ike_sa);
-		me = me->clone(me);
-		other = ike_sa->get_other_host(ike_sa);
-		other = other->clone(other);
-		my_id = ike_sa->get_my_id(ike_sa);
-		my_id = my_id->clone(my_id);
-		other_id = ike_sa->get_other_id(ike_sa);
-		other_id = other_id->clone(other_id);
-		xauth = ike_sa->get_other_eap_id(ike_sa);
-		xauth = xauth->clone(xauth);
-		cfg = ike_sa->get_peer_cfg(ike_sa);
-		cfg->get_ref(cfg);
-
-		charon->ike_sa_manager->checkin(charon->ike_sa_manager, ike_sa);
+		me = new_sa->get_my_host(new_sa);
+		other = new_sa->get_other_host(new_sa);
+		my_id = new_sa->get_my_id(new_sa);
+		other_id = new_sa->get_other_id(new_sa);
+		xauth = new_sa->get_other_eap_id(new_sa);
+		cfg = new_sa->get_peer_cfg(new_sa);
 
 		/* find old SA to adopt children and virtual IPs from */
 		vips = linked_list_create();
@@ -96,25 +88,25 @@ METHOD(job_t, execute, job_requeue_t,
 			{	/* not from self */
 				continue;
 			}
-			ike_sa = charon->ike_sa_manager->checkout(charon->ike_sa_manager, id);
-			if (ike_sa)
+			old_sa = charon->ike_sa_manager->checkout(charon->ike_sa_manager, id);
+			if (old_sa)
 			{
-				if ((ike_sa->get_state(ike_sa) == IKE_ESTABLISHED ||
-					 ike_sa->get_state(ike_sa) == IKE_PASSIVE) &&
-					me->equals(me, ike_sa->get_my_host(ike_sa)) &&
-					other->equals(other, ike_sa->get_other_host(ike_sa)) &&
-					other_id->equals(other_id, ike_sa->get_other_id(ike_sa)) &&
-					cfg->equals(cfg, ike_sa->get_peer_cfg(ike_sa)))
+				if ((old_sa->get_state(old_sa) == IKE_ESTABLISHED ||
+					 old_sa->get_state(old_sa) == IKE_PASSIVE) &&
+					me->equals(me, old_sa->get_my_host(old_sa)) &&
+					other->equals(other, old_sa->get_other_host(old_sa)) &&
+					other_id->equals(other_id, old_sa->get_other_id(old_sa)) &&
+					cfg->equals(cfg, old_sa->get_peer_cfg(old_sa)))
 				{
-					subenum = ike_sa->create_child_sa_enumerator(ike_sa);
+					subenum = old_sa->create_child_sa_enumerator(old_sa);
 					while (subenum->enumerate(subenum, &child_sa))
 					{
-						ike_sa->remove_child_sa(ike_sa, subenum);
+						old_sa->remove_child_sa(old_sa, subenum);
 						children->insert_last(children, child_sa);
 					}
 					subenum->destroy(subenum);
 
-					subenum = ike_sa->create_virtual_ip_enumerator(ike_sa, FALSE);
+					subenum = old_sa->create_virtual_ip_enumerator(old_sa, FALSE);
 					while (subenum->enumerate(subenum, &vip))
 					{
 						vips->insert_last(vips, vip->clone(vip));
@@ -123,22 +115,22 @@ METHOD(job_t, execute, job_requeue_t,
 					/* this does not release the addresses, which is good, but
 					 * it does trigger an assign_vips(FALSE) event, so we also
 					 * trigger one below */
-					ike_sa->clear_virtual_ips(ike_sa, FALSE);
+					old_sa->clear_virtual_ips(old_sa, FALSE);
 					if (children->get_count(children) || vips->get_count(vips))
 					{
 						DBG1(DBG_IKE, "detected reauth of existing IKE_SA, "
 							 "adopting %d children and %d virtual IPs",
 							 children->get_count(children), vips->get_count(vips));
 					}
-					ike_sa->set_state(ike_sa, IKE_DELETING);
-					charon->bus->ike_updown(charon->bus, ike_sa, FALSE);
+					old_sa->set_state(old_sa, IKE_DELETING);
+					charon->bus->ike_updown(charon->bus, old_sa, FALSE);
 					charon->ike_sa_manager->checkin_and_destroy(
-											charon->ike_sa_manager, ike_sa);
+											charon->ike_sa_manager, old_sa);
 				}
 				else
 				{
 					charon->ike_sa_manager->checkin(
-											charon->ike_sa_manager, ike_sa);
+											charon->ike_sa_manager, old_sa);
 				}
 				if (children->get_count(children) || vips->get_count(vips))
 				{
@@ -148,80 +140,46 @@ METHOD(job_t, execute, job_requeue_t,
 		}
 		enumerator->destroy(enumerator);
 
-		me->destroy(me);
-		other->destroy(other);
-		my_id->destroy(my_id);
-		other_id->destroy(other_id);
-		xauth->destroy(xauth);
-		cfg->destroy(cfg);
-
-		if (children->get_count(children) || vips->get_count(vips))
+		while (children->remove_last(children, (void**)&child_sa) == SUCCESS)
 		{
-			/* adopt children by new SA */
-			ike_sa = charon->ike_sa_manager->checkout(charon->ike_sa_manager,
-													  this->id);
-			if (ike_sa)
-			{
-				while (children->remove_last(children,
-											 (void**)&child_sa) == SUCCESS)
-				{
-					ike_sa->add_child_sa(ike_sa, child_sa);
-				}
-				if (vips->get_count(vips))
-				{
-					while (vips->remove_first(vips, (void**)&vip) == SUCCESS)
-					{
-						ike_sa->add_virtual_ip(ike_sa, FALSE, vip);
-						vip->destroy(vip);
-					}
-					charon->bus->assign_vips(charon->bus, ike_sa, TRUE);
-				}
-				charon->ike_sa_manager->checkin(charon->ike_sa_manager, ike_sa);
-			}
+			new_sa->add_child_sa(new_sa, child_sa);
 		}
-		children->destroy_offset(children, offsetof(child_sa_t, destroy));
-		/* FIXME: if we still have addresses here it means we weren't able to
-		 * find the new SA anymore (not sure how likely that is), so we should
-		 * probably release the addresses (we removed them from the original SA,
-		 * so they were not released when that got destroyed).
-		 * the problem is, though, that the release_address() method now takes
-		 * an IKE_SA object (plus a list of pools)...
-		 * and since we already destroyed the original SA... (maybe we could
-		 * delay that, although it could also have been deleted by the other peer
-		 * in the meantime) - or can we actually delay the checkin of the old SA?
-		 * i.e. do the above with two IKE_SAs checked out concurrently?
-		 * we could also create a simple object that partially implements the
-		 * ike_sa_t interface, in particular the get_other_eap_id() method (which
-		 * most backends will want to query), and return the id (xauth above) from
-		 * there - the pools we could get from the cfg object above - but
-		 * depending on the attr backend and what exactly it accesses on the
-		 * ike_sa object that could break miserably */
-		vips->destroy_offset(vips, offsetof(host_t, destroy));
+		children->destroy(children);
+
+		if (vips->get_count(vips))
+		{
+			while (vips->remove_first(vips, (void**)&vip) == SUCCESS)
+			{
+				new_sa->add_virtual_ip(new_sa, FALSE, vip);
+				vip->destroy(vip);
+			}
+			charon->bus->assign_vips(charon->bus, new_sa, TRUE);
+		}
+		vips->destroy(vips);
 
 		if (array_count(this->tasks))
 		{
-			ike_sa = charon->ike_sa_manager->checkout(charon->ike_sa_manager,
-													  this->id);
-			if (ike_sa)
-			{
-				task_t *task;
+			task_t *task;
 
-				while (array_remove(this->tasks, ARRAY_HEAD, &task))
-				{
-					task->migrate(task, ike_sa);
-					ike_sa->queue_task(ike_sa, task);
-				}
-				if (ike_sa->initiate(ike_sa, NULL, 0, NULL, NULL) == DESTROY_ME)
-				{
-					charon->ike_sa_manager->checkin_and_destroy(
-											charon->ike_sa_manager, ike_sa);
-				}
-				else
-				{
-					charon->ike_sa_manager->checkin(charon->ike_sa_manager,
-													ike_sa);
-				}
+			while (array_remove(this->tasks, ARRAY_HEAD, &task))
+			{
+				task->migrate(task, new_sa);
+				new_sa->queue_task(new_sa, task);
 			}
+			if (new_sa->initiate(new_sa, NULL, 0, NULL, NULL) == DESTROY_ME)
+			{
+				charon->ike_sa_manager->checkin_and_destroy(
+												charon->ike_sa_manager, new_sa);
+			}
+			else
+			{
+				charon->ike_sa_manager->checkin(charon->ike_sa_manager,
+												new_sa);
+			}
+		}
+		else
+		{
+			charon->ike_sa_manager->checkin(charon->ike_sa_manager, new_sa);
 		}
 	}
 	return JOB_REQUEUE_NONE;
